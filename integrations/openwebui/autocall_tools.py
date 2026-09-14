@@ -116,6 +116,25 @@ def _normalize(symbol: str) -> str:
     return cleaned
 
 
+def _incomplete_basket(tickers: tuple, closes) -> str:
+    """Refusal when an underlying could not be loaded, or ''.
+
+    A basket analysed without one of its underlyings is another product: its
+    correlation, its distance to the barrier and its replay all change, and
+    nothing in the figures shows it. The profile once reported the missing name
+    in its last line while the two other tools said nothing at all.
+    """
+    missing = [t for t in tickers if t not in closes.columns]
+    if not missing:
+        return ""
+    return (
+        f"Sous-jacent(s) introuvable(s) : {', '.join(missing)}. Aucun calcul sur un panier "
+        "incomplet : ce serait un autre produit. Verifier le ticker et son code de place — "
+        "le ticker n'est pas le nom de la societe (AXA cote CS.PA a Paris) — puis relancer "
+        "avec le panier complet."
+    )
+
+
 def _split(raw: str) -> list[str]:
     """Parse a comma-separated argument into a clean list."""
     return [part.strip() for part in (raw or "").replace(";", ",").split(",") if part.strip()]
@@ -466,13 +485,40 @@ class Tools:
         safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in symbol)
         return os.path.join(base, f"{safe}.csv")
 
+    @staticmethod
+    def _session_index(frame):
+        """The same frame indexed by naive session dates.
+
+        Yahoo stamps each session at local midnight with its UTC offset, and the
+        offset changes with daylight saving (+01:00 in winter, +02:00 in summer).
+        Written to CSV and read back, such an index does not come back as dates:
+        depending on the pandas version it is a column of strings or of mixed-offset
+        objects, and the first comparison with the analysis date raised — so every
+        call after the one that filled the cache failed. The local calendar date is
+        what a barrier observation refers to, so it is kept, and the offset dropped
+        (converting to UTC first would move a Paris session to the previous day).
+        """
+        if frame is None or frame.empty:
+            return frame
+        frame = frame.copy()
+        index = frame.index
+        if isinstance(index, pd.DatetimeIndex):
+            index = index.tz_localize(None) if index.tz is not None else index
+        else:
+            # Strings or offset-carrying objects: the first ten characters are the
+            # local session date whatever the offset that follows.
+            index = pd.to_datetime(pd.Index(index).astype(str).str.slice(0, 10), errors="coerce")
+        frame.index = pd.DatetimeIndex(index).normalize()
+        frame = frame[frame.index.notna()]
+        return frame[~frame.index.duplicated(keep="last")].sort_index()
+
     def _read_cache(self, symbol: str):
         """Cached series for one symbol, or None."""
         path = self._cache_path(symbol)
         if not path or not os.path.exists(path):
             return None
         try:
-            frame = pd.read_csv(path, index_col=0, parse_dates=True)
+            frame = self._session_index(pd.read_csv(path, index_col=0))
         except Exception:
             return None
         # Older cache files predate the Dividends column; their absence must not
@@ -484,6 +530,7 @@ class Tools:
         path = self._cache_path(symbol)
         if not path or frame is None or frame.empty:
             return
+        frame = self._session_index(frame)
         existing = self._read_cache(symbol)
         if existing is not None:
             # combine_first rather than concat: the new download wins on every
@@ -573,7 +620,7 @@ class Tools:
         """
         cached = self._read_cache(symbol)
         needed_start = as_of - timedelta(days=int(years * 365.25))
-        if cached is not None:
+        if cached is not None and not cached.empty:
             covered = cached.index.max() >= pd.Timestamp(as_of) - pd.Timedelta(days=5)
             deep_enough = cached.index.min() <= pd.Timestamp(needed_start) + pd.Timedelta(days=10)
             if covered and deep_enough:
@@ -616,6 +663,7 @@ class Tools:
             # Nothing live: a cache that does not quite reach today still beats
             # refusing the analysis, provided the caller is told.
             return (cached, "cache (perime)") if cached is not None else (None, "")
+        frame = self._session_index(frame)
         self._write_cache(symbol, frame)
         return frame, source
 
@@ -894,6 +942,9 @@ class Tools:
             return (
                 _unresolved_message(tickers, as_of, "niveaux")
             )
+        incomplete = _incomplete_basket(tickers, closes)
+        if incomplete:
+            return incomplete
 
         conflict = _mono_conflict(basket_mode, len(closes.columns))
         if conflict:
@@ -1246,6 +1297,9 @@ class Tools:
             return (
                 _unresolved_message(tickers, as_of, "niveaux")
             )
+        incomplete = _incomplete_basket(tickers, closes)
+        if incomplete:
+            return incomplete
 
         conflict = _mono_conflict(basket_mode, len(closes.columns)) or _check_weights(
             basket_weights or [], len(closes.columns)
@@ -1413,6 +1467,9 @@ class Tools:
             return (
                 _unresolved_message(tickers, as_of, "probabilites")
             )
+        incomplete = _incomplete_basket(tickers, closes)
+        if incomplete:
+            return incomplete
 
         conflict = _mono_conflict(basket_mode, len(closes.columns)) or _check_weights(
             basket_weights or [], len(closes.columns)
